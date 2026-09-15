@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 7%;
+    --foreground: 210 40% 98%;
+  }
+  
+  body {
+    @apply bg-slate-950 text-slate-100 font-sans antialiased min-h-screen selection:bg-amber-500 selection:text-slate-950;
+    background-image: 
+      radial-gradient(at 0% 0%, rgba(217, 119, 6, 0.08) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(30, 41, 59, 0.5) 0px, transparent 50%);
+  }
+}
+
+.glass-panel {
+  @apply bg-slate-900/70 backdrop-blur-md border border-slate-800/80 rounded-xl shadow-xl;
+}
+
+.glass-panel-hover {
+  @apply glass-panel transition-all duration-300 hover:border-amber-500/40 hover:shadow-amber-500/5;
+}
+
+.gold-gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-amber-200 via-amber-400 to-amber-500;
+}
+
+.indic-tag {
+  @apply px-2.5 py-1 text-xs font-semibold rounded-full border transition-all;
+}

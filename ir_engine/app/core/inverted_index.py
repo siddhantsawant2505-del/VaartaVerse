@@ -50,6 +50,7 @@ class DocMeta:
     translator: str
     collection_era: str
     token_count: int = 0
+    snippet: str = ""  # first ~200 chars of body, for result previews
 
 
 class InvertedIndex:
@@ -107,6 +108,7 @@ class InvertedIndex:
             translator=translator,
             collection_era=collection_era,
             token_count=len(all_tokens),
+            snippet=(body[:200] + "…") if len(body) > 200 else body,
         )
 
         # Build postings
@@ -197,7 +199,22 @@ class InvertedIndex:
                     zones=data["zones"],
                 )
         raw_docs = json.loads(DOC_REGISTRY_FILE.read_text(encoding="utf-8"))
-        self._docs = {k: DocMeta(**v) for k, v in raw_docs.items()}
+        self._docs = {
+            k: DocMeta(
+                doc_id=v.get("doc_id", k),
+                tale_id=v.get("tale_id", k),
+                title=v.get("title", ""),
+                tale_type=v.get("tale_type", ""),
+                region=v.get("region", ""),
+                tradition=v.get("tradition", ""),
+                source_collection=v.get("source_collection", ""),
+                translator=v.get("translator", ""),
+                collection_era=v.get("collection_era", ""),
+                token_count=v.get("token_count", 0),
+                snippet=v.get("snippet", ""),
+            )
+            for k, v in raw_docs.items()
+        }
         print(f"[InvertedIndex] Loaded {len(self._docs)} docs, {len(self._postings)} terms from disk.")
         return True
 

@@ -203,12 +203,26 @@ def search_nl_query(req: NLQueryRequest):
     """
     parser = get_nl_parser()
     parsed = parser.parse(req.query)
+    results = []
     if parsed["mode"] == "boolean":
         results = get_boolean().search(parsed["structured_query"])
+        # If boolean search yielded 0 results, fall back to ranked VSM search
+        if not results:
+            filters = parsed.get("filters", {})
+            results = get_vsm().search(
+                query=parsed["normalized_query"] or req.query,
+                top_k=req.top_k,
+                collection_filter=filters.get("tradition"),
+                region_filter=filters.get("region"),
+            )
+            parsed["mode"] = "vsm_fallback"
     else:
+        filters = parsed.get("filters", {})
         results = get_vsm().search(
-            query=parsed["normalized_query"],
+            query=parsed["normalized_query"] or req.query,
             top_k=req.top_k,
+            collection_filter=filters.get("tradition"),
+            region_filter=filters.get("region"),
         )
     return {
         "mode": "nl_query",

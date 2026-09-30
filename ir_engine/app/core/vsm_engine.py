@@ -63,7 +63,11 @@ class VSMEngine:
 
         query_terms = preprocess(query)
         if not query_terms:
-            return []
+            # Fallback for stopword-only or punctuation inputs: keep raw alphanumeric words
+            import re
+            query_terms = [t.lower() for t in re.findall(r"\b[a-zA-Z0-9]+\b", query) if len(t) > 1]
+            if not query_terms:
+                return []
 
         N = self._index.doc_count()
         if N == 0:
@@ -81,6 +85,22 @@ class VSMEngine:
                 continue
             idf = math.log((N + 1) / (df + 1))
             query_vec[term] = _sublinear_tf(tf) * idf
+
+        # If no exact terms match the index vocabulary, try prefix / substring fallback
+        if not query_vec:
+            vocab = self._index.vocabulary()
+            for term in query_tf:
+                if len(term) < 3:
+                    continue
+                matches = [v for v in vocab if term in v or (len(v) >= 4 and v in term)]
+                for v in matches[:4]:
+                    df = self._index.get_df(v)
+                    if df > 0 and v not in query_vec:
+                        idf = math.log((N + 1) / (df + 1))
+                        query_vec[v] = _sublinear_tf(1) * idf * 0.75
+
+        if not query_vec:
+            return []
 
         # Accumulate scores per document (inverted-index traversal)
         scores: dict[str, float] = {}
@@ -138,10 +158,9 @@ class VSMEngine:
                 result = asdict(meta)
                 result["score"] = round(score, 6)
                 result["zone_weights"] = zone_weights
-                # Matched stems for snippet highlighting
+                # Matched stems for snippet highlighting (doc_id in postings of term)
                 result["terms_matched"] = [
-                    t for t in query_vec if t in self._index.get_postings(t)
-                    and doc_id in self._index.get_postings(t)
+                    t for t in query_vec if doc_id in self._index.get_postings(t)
                 ]
                 results.append(result)
 

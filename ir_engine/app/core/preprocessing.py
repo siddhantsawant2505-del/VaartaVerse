@@ -41,10 +41,10 @@ _lemmatizer = WordNetLemmatizer()
 _ENGLISH_STOPS = set(stopwords.words("english"))
 
 # Domain stopwords specific to this folk tale corpus
+# NOTE: Keep only true discourse filler words — NOT content words users may search for
 _DOMAIN_STOPS = {
-    "said", "one", "day", "went", "came", "upon", "time", "king", "great",
-    "long", "also", "well", "good", "told", "man", "did", "two", "three",
-    "come", "knew", "seen", "thus", "therefore", "replied",
+    "said", "upon", "also", "did", "knew", "seen", "thus",
+    "therefore", "replied", "amongst", "thereof",
 }
 
 ALL_STOPWORDS = _ENGLISH_STOPS | _DOMAIN_STOPS

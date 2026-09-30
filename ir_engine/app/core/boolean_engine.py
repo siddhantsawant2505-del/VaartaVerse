@@ -138,15 +138,33 @@ class BooleanEngine:
             r"\b(and|or|not)\b", lambda m: m.group(0).upper(), query.strip()
         )
 
+        has_explicit_bool = any(op in normalized.split() for op in ("AND", "OR", "NOT"))
+
         # If no boolean operators detected, default to AND of all terms
-        if not any(op in normalized.split() for op in ("AND", "OR", "NOT")):
-            terms = [t.upper() if t.upper() in ("AND", "OR", "NOT") else t for t in normalized.split()]
+        if not has_explicit_bool:
+            terms = [t for t in normalized.split() if t]
             normalized = " AND ".join(terms)
 
+        matching_ids = set()
         try:
             matching_ids = self._parser.parse_and_eval(normalized)
-        except BooleanParseError as e:
-            return [{"error": str(e)}]
+        except BooleanParseError:
+            # Fallback for syntax errors (e.g. unclosed paren): extract clean words and match any
+            clean_words = re.findall(r"\b[A-Za-z0-9]+\b", query)
+            for w in clean_words:
+                if w.upper() in ("AND", "OR", "NOT"):
+                    continue
+                stems = preprocess(w)
+                for s in stems:
+                    matching_ids.update(self._index.get_postings(s).keys())
+
+        # If implicit AND returned 0 matches, relax to OR of all terms so user gets results
+        if not matching_ids and not has_explicit_bool:
+            clean_words = re.findall(r"\b[A-Za-z0-9]+\b", query)
+            for w in clean_words:
+                stems = preprocess(w)
+                for s in stems:
+                    matching_ids.update(self._index.get_postings(s).keys())
 
         results = []
         for doc_id in sorted(matching_ids):

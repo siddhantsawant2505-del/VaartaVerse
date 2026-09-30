@@ -140,8 +140,9 @@ class NLQueryParser:
         text = re.sub(r"\s{2,}", " ", text).strip()
 
         # Step 3 — detect boolean operators
+        # Require uppercase AND/OR/NOT or explicit parentheses to distinguish from natural English 'and'
         has_explicit_boolean = bool(
-            re.search(r"\b(AND|OR|NOT)\b", raw_query, re.IGNORECASE)
+            re.search(r"\b(AND|OR|NOT)\b", raw_query) or re.search(r"\([^\)]+\)", raw_query)
         )
         has_implicit_boolean = any(
             re.search(p, text, re.IGNORECASE) for p, _ in BOOLEAN_PHRASE_PATTERNS

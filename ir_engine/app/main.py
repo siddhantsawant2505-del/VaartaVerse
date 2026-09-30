@@ -2,16 +2,22 @@
 VaartaVerse Classical IR Engine — FastAPI Entry Point
 Implements all retrieval, feedback, evaluation, and divergence endpoints.
 No LLMs, no external vector databases — pure hand-crafted IR math.
+
+Error policy: malformed boolean queries and stopword-only queries return
+HTTP 422 with the parser's message — no silent fallbacks, no invented results.
 """
+
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
 
-from app.core.inverted_index import InvertedIndex
-from app.core.boolean_engine import BooleanEngine
+from app.core.inverted_index import InvertedIndex, corpus_fingerprint
+from app.core.boolean_engine import BooleanEngine, BooleanParseError
 from app.core.vsm_engine import VSMEngine
+from app.core.bm25_engine import BM25Engine
 from app.core.relevance_feedback import RocchioFeedback
 from app.core.nl_parser import NLQueryParser
 from app.core.evaluation import EvaluationHarness
@@ -22,11 +28,11 @@ app = FastAPI(
     title="VaartaVerse Classical IR Engine",
     description=(
         "Hand-crafted Information Retrieval engine for cross-regional Indian folk tale lineage. "
-        "Implements inverted index, Boolean retrieval, TF-IDF VSM, Rocchio feedback, "
-        "rule-based NL query parsing, MAP/nDCG evaluation, and pairwise cosine divergence. "
-        "No LLMs or external vector DBs."
+        "Implements inverted index, Boolean retrieval (NOT > AND > OR), TF-IDF VSM with real "
+        "zone weighting, BM25, Rocchio feedback (explicit + PRF), rule-based NL query parsing, "
+        "MAP/nDCG evaluation, and pairwise cosine divergence. No LLMs or external vector DBs."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -43,10 +49,22 @@ app.add_middleware(
 _index: Optional[InvertedIndex] = None
 _boolean_engine: Optional[BooleanEngine] = None
 _vsm_engine: Optional[VSMEngine] = None
+_bm25_engine: Optional[BM25Engine] = None
 _rocchio: Optional[RocchioFeedback] = None
 _nl_parser: Optional[NLQueryParser] = None
 _eval_harness: Optional[EvaluationHarness] = None
 _divergence: Optional[DivergenceCalculator] = None
+
+
+def _build_index_from_corpus(index: InvertedIndex) -> None:
+    pipeline = IngestionPipeline(index)
+    stats = pipeline.ingest_from_json()
+    if stats["documents_ingested"] > 0:
+        pipeline.save_index()
+        print(f"[VaartaVerse] Index built: {stats['documents_ingested']} docs, "
+              f"{stats['terms_indexed']} terms.")
+    else:
+        print("[VaartaVerse] Seed corpus empty or not found. Index will be empty.")
 
 
 def get_index() -> InvertedIndex:
@@ -54,17 +72,15 @@ def get_index() -> InvertedIndex:
     if _index is None:
         _index = InvertedIndex()
         if not _index.load():
-            # Auto-build from seed JSON corpus on first startup
-            print("[VaartaVerse] No persisted index found — auto-building from seed corpus...")
-            pipeline = IngestionPipeline(_index)
-            stats = pipeline.ingest_from_json()
-            if stats["documents_ingested"] > 0:
-                pipeline.save_index()
-                print(f"[VaartaVerse] Index built: {stats['documents_ingested']} docs, "
-                      f"{stats['terms_indexed']} terms.")
-            else:
-                print("[VaartaVerse] Seed corpus empty or not found. Index will be empty.")
+            print("[VaartaVerse] No valid persisted index — auto-building from seed corpus...")
+            _build_index_from_corpus(_index)
     return _index
+
+
+def reset_engines() -> None:
+    """Drop all engine singletons (after ingestion/rebuild) so they rebuild on next use."""
+    global _vsm_engine, _boolean_engine, _bm25_engine, _rocchio, _divergence, _eval_harness
+    _vsm_engine = _boolean_engine = _bm25_engine = _rocchio = _divergence = _eval_harness = None
 
 
 def get_vsm() -> VSMEngine:
@@ -72,6 +88,13 @@ def get_vsm() -> VSMEngine:
     if _vsm_engine is None:
         _vsm_engine = VSMEngine(get_index())
     return _vsm_engine
+
+
+def get_bm25() -> BM25Engine:
+    global _bm25_engine
+    if _bm25_engine is None:
+        _bm25_engine = BM25Engine(get_index())
+    return _bm25_engine
 
 
 def get_boolean() -> BooleanEngine:
@@ -101,6 +124,7 @@ def get_eval() -> EvaluationHarness:
         _eval_harness = EvaluationHarness(
             boolean_engine=get_boolean(),
             vsm_engine=get_vsm(),
+            bm25_engine=get_bm25(),
             rocchio=get_rocchio(),
         )
     return _eval_harness
@@ -130,6 +154,25 @@ class VSMQueryRequest(BaseModel):
     region_filter: Optional[str] = None
     zone_weights: dict = {"title": 0.35, "body": 0.65}
 
+    @field_validator("zone_weights")
+    @classmethod
+    def _check_weights(cls, v: dict) -> dict:
+        for key in ("title", "body"):
+            w = v.get(key)
+            if not isinstance(w, (int, float)) or w < 0:
+                raise ValueError(f"zone weight '{key}' must be a non-negative number")
+        return v
+
+
+class BM25QueryRequest(BaseModel):
+    query: str
+    top_k: int = 10
+    k1: Optional[float] = None
+    b: Optional[float] = None
+    title_boost: float = 1.5
+    collection_filter: Optional[str] = None
+    region_filter: Optional[str] = None
+
 
 class NLQueryRequest(BaseModel):
     query: str
@@ -147,9 +190,17 @@ class FeedbackRequest(BaseModel):
     gamma: float = 0.15   # Rocchio γ — non-relevant centroid weight
 
 
+class PRFRequest(BaseModel):
+    query: str
+    top_k: int = 10
+    prf_k: int = 3
+    beta: float = 0.75
+
+
 class EvaluateRequest(BaseModel):
-    modes: list[str] = ["boolean", "vsm", "vsm_rocchio"]
+    modes: list[str] = ["boolean", "vsm", "bm25", "vsm_rocchio"]
     qrel_query_ids: Optional[list[str]] = None  # None = run all qrels
+    qrels_path: Optional[str] = None            # optional qrels JSON file
 
 
 # ---------------------------------------------------------------------------
@@ -158,29 +209,44 @@ class EvaluateRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
+    index = get_index()
+    corpus_path = Path(__import__("os").getenv("CORPUS_PATH", "./data/corpus/tales.json"))
+    current_fp = corpus_fingerprint(corpus_path)
     return {
         "status": "ok",
         "service": "VaartaVerse Classical IR Engine",
-        "corpus_size": get_index().doc_count(),
+        "version": app.version,
+        "corpus_size": index.doc_count(),
+        "vocabulary_size": len(index.vocabulary()),
+        "index_stale": bool(current_fp) and current_fp != (
+            Path("data/index/corpus_fingerprint.json").read_text(encoding="utf-8").strip()
+            if Path("data/index/corpus_fingerprint.json").exists() else None
+        ),
     }
 
 
 @app.post("/search/boolean")
 def search_boolean(req: BooleanQueryRequest):
     """
-    Boolean retrieval using AND / OR / NOT with parenthesized expressions.
-    Returns matching doc IDs and metadata (unranked set).
+    Boolean retrieval with standard precedence (NOT > AND > OR), implicit AND
+    via juxtaposition, and tf-idf ranking of the matching set.
+    Malformed queries return HTTP 422 with the parse error.
     """
-    engine = get_boolean()
-    results = engine.search(req.query, filters=req.filters)
+    try:
+        results = get_boolean().search(req.query, filters=req.filters)
+    except BooleanParseError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "boolean_parse_error", "message": str(e)},
+        )
     return {"mode": "boolean", "query": req.query, "results": results, "count": len(results)}
 
 
 @app.post("/search/vsm")
 def search_vsm(req: VSMQueryRequest):
     """
-    Vector Space Model retrieval with TF-IDF weighting, sublinear TF scaling,
-    zone/field weighting (title vs body), and cosine similarity top-K ranking.
+    Vector Space Model retrieval: TF-IDF with always-positive smoothed idf,
+    real zone weighting (full-document norms), cosine similarity top-K ranking.
     """
     engine = get_vsm()
     results = engine.search(
@@ -193,39 +259,58 @@ def search_vsm(req: VSMQueryRequest):
     return {"mode": "vsm", "query": req.query, "results": results, "count": len(results)}
 
 
+@app.post("/search/bm25")
+def search_bm25(req: BM25QueryRequest):
+    """
+    Okapi BM25 ranking: saturating TF, document-length normalization, and a
+    title-zone boost. The classical baseline against the VSM.
+    """
+    engine = get_bm25()
+    results = engine.search(
+        query=req.query,
+        top_k=req.top_k,
+        k1=req.k1,
+        b=req.b,
+        title_boost=req.title_boost,
+        collection_filter=req.collection_filter,
+        region_filter=req.region_filter,
+    )
+    return {"mode": "bm25", "query": req.query, "results": results, "count": len(results)}
+
+
+def _vsm_search_with_filters(parsed: dict, req: NLQueryRequest) -> list[dict]:
+    filters = parsed.get("filters", {})
+    return get_vsm().search(
+        query=parsed["normalized_query"] or req.query,
+        top_k=req.top_k,
+        collection_filter=filters.get("tradition"),
+        region_filter=filters.get("region"),
+    )
+
+
 @app.post("/search/nl-query")
 def search_nl_query(req: NLQueryRequest):
     """
     Rule-based natural language query parser.
-    Extracts keywords, identifies known regions/traditions/tale-types,
-    detects implicit boolean operators from phrase patterns,
-    then dispatches to VSM or Boolean engine appropriately.
+    Extracts keywords and known regions/traditions/tale-types, detects boolean
+    structure, then dispatches to the appropriate engine. If a parsed boolean
+    query matches nothing, falls back to ranked VSM (and reports it in `mode`).
     """
     parser = get_nl_parser()
     parsed = parser.parse(req.query)
-    results = []
+    fallback_used = False
     if parsed["mode"] == "boolean":
-        results = get_boolean().search(parsed["structured_query"])
-        # If boolean search yielded 0 results, fall back to ranked VSM search
+        try:
+            results = get_boolean().search(parsed["structured_query"])
+        except BooleanParseError:
+            results = []
         if not results:
-            filters = parsed.get("filters", {})
-            results = get_vsm().search(
-                query=parsed["normalized_query"] or req.query,
-                top_k=req.top_k,
-                collection_filter=filters.get("tradition"),
-                region_filter=filters.get("region"),
-            )
-            parsed["mode"] = "vsm_fallback"
+            results = _vsm_search_with_filters(parsed, req)
+            fallback_used = True
     else:
-        filters = parsed.get("filters", {})
-        results = get_vsm().search(
-            query=parsed["normalized_query"] or req.query,
-            top_k=req.top_k,
-            collection_filter=filters.get("tradition"),
-            region_filter=filters.get("region"),
-        )
+        results = _vsm_search_with_filters(parsed, req)
     return {
-        "mode": "nl_query",
+        "mode": "vsm_fallback" if fallback_used else "nl_query",
         "original_query": req.query,
         "parsed": parsed,
         "results": results,
@@ -236,10 +321,8 @@ def search_nl_query(req: NLQueryRequest):
 @app.post("/search/feedback")
 def search_feedback(req: FeedbackRequest):
     """
-    Rocchio relevance feedback — shifts query vector toward relevant document
-    centroids and away from non-relevant ones, then re-retrieves top-K.
-
-    Modified query: q_m = α·q₀ + β·(1/|Dr|)·Σd∈Dr - γ·(1/|Dnr|)·Σd∈Dnr
+    Rocchio relevance feedback — shifts the query vector toward relevant
+    document centroids and away from non-relevant ones, then re-ranks top-K.
     """
     rocchio = get_rocchio()
     results = rocchio.rerank(
@@ -260,16 +343,51 @@ def search_feedback(req: FeedbackRequest):
     }
 
 
+@app.post("/search/prf")
+def search_prf(req: PRFRequest):
+    """
+    Pseudo-Relevance Feedback (blind feedback): assumes the top prf_k VSM
+    results are relevant and applies Rocchio expansion. No user input needed.
+    """
+    results = get_rocchio().pseudo_relevance_feedback(
+        query=req.query,
+        top_k=req.top_k,
+        prf_k=req.prf_k,
+        beta=req.beta,
+    )
+    return {
+        "mode": "vsm_prf",
+        "original_query": req.query,
+        "prf_params": {"prf_k": req.prf_k, "beta": req.beta},
+        "results": results,
+        "count": len(results),
+    }
+
+
 @app.post("/evaluate")
 def evaluate(req: EvaluateRequest):
     """
-    Runs the evaluation harness against human-curated qrels.
-    Computes Precision, Recall, F1 (unranked) and P@K, MAP, nDCG (ranked)
-    for each requested retrieval mode.
+    Runs the evaluation harness against qrels. Computes per-query and mean
+    Precision, Recall, F1, P@K, MAP, nDCG for each requested retrieval mode.
     """
-    harness = get_eval()
-    report = harness.run(modes=req.modes, qrel_query_ids=req.qrel_query_ids)
+    try:
+        harness = get_eval()
+        report = harness.run(
+            modes=req.modes,
+            qrel_query_ids=req.qrel_query_ids,
+            qrels_path=req.qrels_path,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"qrels file not found: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return report
+
+
+@app.get("/tale-types")
+def list_tale_types():
+    """Distinct tale types in the index with variant counts (the registry)."""
+    return {"tale_types": get_index().all_tale_types()}
 
 
 @app.get("/tale-type/{tale_type_id}/variants")
@@ -299,7 +417,7 @@ def get_divergence_route(tale_type_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Ingestion Endpoints — Phase 2
+# Ingestion Endpoints
 # ---------------------------------------------------------------------------
 
 class IngestDocumentRequest(BaseModel):
@@ -326,9 +444,7 @@ def ingest_document(req: IngestDocumentRequest):
     The index is updated in memory and persisted to disk immediately.
     """
     index = get_index()
-    # Reset downstream singletons so they pick up the new doc
-    global _vsm_engine, _boolean_engine, _rocchio, _divergence, _eval_harness
-    _vsm_engine = _boolean_engine = _rocchio = _divergence = _eval_harness = None
+    reset_engines()
 
     pipeline = IngestionPipeline(index)
     success = pipeline.ingest_document(req.model_dump())
@@ -351,10 +467,9 @@ def ingest_rebuild(req: IngestRebuildRequest):
     Sources: 'json' (seed file), 'mongodb', or 'both'.
     Resets all engine singletons after rebuild.
     """
-    global _index, _vsm_engine, _boolean_engine, _rocchio, _divergence, _eval_harness, _nl_parser
-    # Clear all singletons
+    global _index
+    reset_engines()
     _index = InvertedIndex()
-    _vsm_engine = _boolean_engine = _rocchio = _divergence = _eval_harness = None
 
     pipeline = IngestionPipeline(_index)
 
@@ -390,13 +505,7 @@ def ingest_status():
     return {
         "corpus_size": index.doc_count(),
         "vocabulary_size": len(index.vocabulary()),
-        "tale_types": list({
-            m.tale_type for m in index._docs.values()
-        }),
-        "traditions": list({
-            m.tradition for m in index._docs.values()
-        }),
-        "regions": list({
-            m.region for m in index._docs.values()
-        }),
+        "tale_types": list({m.tale_type for m in index._docs.values()}),
+        "traditions": list({m.tradition for m in index._docs.values()}),
+        "regions": list({m.region for m in index._docs.values()}),
     }

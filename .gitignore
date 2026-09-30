@@ -29,6 +29,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Generated IR index artifacts (rebuild with: python scripts/seed_and_build.py)
+ir_engine/data/index/
+
 # Logs & Debug
 *.log
 npm-debug.log*

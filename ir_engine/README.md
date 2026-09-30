@@ -32,14 +32,15 @@ ir_engine/
 
 | Module | Core Functionality |
 |---|---|
-| `preprocessing.py` | Tokenization, stopword removal, NLTK WordNet Lemmatization (`pos='n'` + `pos='v'`). |
-| `inverted_index.py` | Multi-zone postings lists (`title`, `tradition`, `region`, `body`), term frequencies, position offsets. |
-| `boolean_engine.py` | Evaluates boolean expressions (`AND`, `OR`, `NOT`, brackets) using AST trees. |
-| `vsm_engine.py` | Computes TF-IDF ($1 + \log tf$) and smooth IDF ($\log(N/df)$), field boosting, cosine scoring. |
-| `relevance_feedback.py` | Implements Rocchio query vector reformulation equation for explicit feedback and PRF. |
+| `preprocessing.py` | Tokenization (possessive-stripping), stopword removal, NLTK WordNet Lemmatization (`pos='n'` + `pos='v'`). |
+| `inverted_index.py` | Multi-zone postings lists (`title`, `body`), term frequencies, position offsets, corpus fingerprint staleness detection. |
+| `boolean_engine.py` | Recursive-descent boolean evaluation with **NOT > AND > OR precedence**, implicit AND, juxtaposed NOT, tf-idf ranking, precise parse errors. |
+| `vsm_engine.py` | TF-IDF ($1 + \log tf$) with always-positive IDF ($\log(1 + N/df)$), title/body boost multipliers, full-vector-norm cosine scoring. |
+| `bm25_engine.py` | Okapi BM25 with saturating TF ($k_1$), length normalization ($b$), and title-zone boost. |
+| `relevance_feedback.py` | Rocchio query reformulation for explicit feedback and PRF, single-pass postings re-ranking. |
 | `nl_parser.py` | Rule-based parser mapping NL queries to structured VSM/Boolean search parameters. |
-| `divergence.py` | Calculates pairwise divergence matrices, Jaccard distance, and vocabulary overlap across variants. |
-| `evaluation.py` | Computes P@K, Recall, MAP, nDCG@K, and F1 metrics against ground-truth `qrels`. |
+| `divergence.py` | Calculates pairwise divergence matrices, Jaccard similarity, and vocabulary overlap across variants. |
+| `evaluation.py` | P@K, Recall, per-query F1, MAP, nDCG@K against injectable `qrels` across boolean/vsm/bm25/vsm_rocchio modes. |
 | `ingestion.py` | Processes text documents and constructs the inverted index on disk. |
 
 ---
@@ -56,3 +57,11 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 FastAPI interactive documentation will be available at **http://localhost:8000/docs**.
+
+## Tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+The suite covers tokenization/possessives, boolean precedence and error handling, VSM zone weighting and idf edge cases, BM25 behavior, metric formulas (hand-computed expectations), index persistence/fingerprints, and the FastAPI surface (including HTTP 422 parse errors).

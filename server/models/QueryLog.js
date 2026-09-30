@@ -10,7 +10,7 @@ const QueryLogSchema = new mongoose.Schema(
     query_text: { type: String, required: true },
     query_mode: {
       type: String,
-      enum: ['boolean', 'vsm', 'nl_query', 'feedback'],
+      enum: ['boolean', 'vsm', 'bm25', 'nl_query', 'feedback', 'prf'],
       required: true,
     },
     parsed_tokens: [{ type: String }],

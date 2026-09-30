@@ -100,11 +100,11 @@ class _BoolParser:
             if nxt == "AND":
                 t.consume()
                 result = result & self._not_expr(t)
-            elif nxt is not None and nxt not in (")", "OR", "AND", "NOT") and nxt != "(":
-                # Juxtaposed term: "jackal tiger" == "jackal AND tiger"
-                result = result & self._not_expr(t)
-            elif nxt == "(":
-                # "(a)(b)" — juxtaposed parenthesized groups are ANDed
+            elif nxt == "NOT" or nxt == "(" or (nxt is not None and nxt not in (")", "OR", "AND")):
+                # Juxtaposition = implicit AND:
+                #   "jackal tiger"  == "jackal AND tiger"
+                #   "jackal NOT tiger" == "jackal AND (NOT tiger)"
+                #   "jackal (lion OR tiger)" == "jackal AND (lion OR tiger)"
                 result = result & self._not_expr(t)
             else:
                 break

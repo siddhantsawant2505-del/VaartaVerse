@@ -8,16 +8,17 @@ Pipeline:
     1. Pattern detection: detect boolean phrases ("tales about X and Y")
     2. Entity extraction: known regions, traditions, tale-type codes from lexicon
     3. Stop phrase removal: strip filler ("find me", "show tales about", "which stories")
-    4. Query expansion: inject region/tradition filters if recognised
+    4. Query expansion: attach region/tradition filters if recognised
     5. Query routing: decide boolean vs VSM based on structure
 
 Example:
     "stories about clever jackal tricking a lion in Panchatantra"
     → mode: vsm
-    → normalized_query: "clever jackal trick lion"
-    → filters: {tradition: "Panchatantra"}
+    → normalized_query: "clever jackal trick lion panchatantra"
+    → filters: {tradition: "Panchatantra"}   (Panchatantra stays in the text too,
+      so "baital riddles" still ranks the Baital tales by content terms)
 
-    "tales with lion AND jackal but NOT tiger"
+    "tales with lion AND jackal but not tiger"
     → mode: boolean
     → structured_query: "lion AND jackal NOT tiger"
 """
@@ -39,23 +40,13 @@ KNOWN_TRADITIONS = {
     "vikramaditya": "Vikramaditya",
     "baital pachisi": "Vikramaditya",
     "baital": "Vikramaditya",
-    "akbar birbal": "Birbal-Akbar",
-    "akbar-birbal": "Birbal-Akbar",
     "birbal": "Birbal-Akbar",
     "akbar": "Birbal-Akbar",
-    "tenali rama": "Tenali Raman",
-    "tenali raman": "Tenali Raman",
     "tenali": "Tenali Raman",
-    "ramayana": "Ramayana",
-    "mahabharata": "Mahabharata",
-    "bengali folk": "Bengali Folk",
-    "bengali": "Bengali Folk",
-    "kashmiri folk": "Kashmiri Folk",
-    "kashmiri": "Kashmiri Folk",
-    "rajasthani folk": "Rajasthani Folk",
-    "rajasthani": "Rajasthani Folk",
+    "tenali raman": "Tenali Raman",
     "puranic": "Puranic/Mythological",
-    "mythological": "Puranic/Mythological",
+    "ramayana": "Puranic/Mythological",
+    "mahabharata": "Puranic/Mythological",
 }
 
 KNOWN_REGIONS = {
@@ -65,12 +56,6 @@ KNOWN_REGIONS = {
     "odisha": "Odisha",
     "magadha": "Magadha",
     "ujjain": "Ujjain",
-    "agra": "Agra",
-    "delhi": "Delhi",
-    "vijayanagara": "Vijayanagara",
-    "ayodhya": "Ayodhya",
-    "hastinapura": "Hastinapura",
-    "rajasthan": "Rajasthan",
     "andhra": "Andhra Pradesh",
     "karnataka": "Karnataka",
     "south india": "South India",
@@ -79,9 +64,14 @@ KNOWN_REGIONS = {
 
 KNOWN_ATU_CODES = {
     r"atu[\s-]?122": "ATU-122",
-    r"atu[\s-]?1430": "ATU-1430",
+    r"atu[\s-]?91": "ATU-91",
     r"atu[\s-]?910": "ATU-910",
     r"atu[\s-]?545": "ATU-545",
+    r"atu[\s-]?1430": "ATU-1430",
+    r"atu[\s-]?157": "ATU-157",
+    r"atu[\s-]?2040": "ATU-2040",
+    r"atu[\s-]?610": "ATU-610",
+    r"atu[\s-]?217": "ATU-217",
 }
 
 # Filler phrases to strip before processing
@@ -133,7 +123,7 @@ class NLQueryParser:
         for pattern in FILLER_PATTERNS:
             text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
-        # Step 2 — extract entities
+        # Step 2 — extract entities (words are KEPT in the text; see module docstring)
         traditions_found = []
         regions_found = []
         atu_codes_found = []
@@ -141,22 +131,23 @@ class NLQueryParser:
         for keyword, canonical in KNOWN_TRADITIONS.items():
             if keyword in text:
                 traditions_found.append(canonical)
-                text = text.replace(keyword, "")
+                # text = text.replace(keyword, "")  # keep the word — it's content
 
         for keyword, canonical in KNOWN_REGIONS.items():
             if keyword in text:
                 regions_found.append(canonical)
-                text = text.replace(keyword, "")
+                # text = text.replace(keyword, "")  # keep the word — it's content
 
         for pattern, code in KNOWN_ATU_CODES.items():
             if re.search(pattern, text, re.IGNORECASE):
                 atu_codes_found.append(code)
-                text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+                # do not remove — ATU codes are content too
 
         text = re.sub(r"\s{2,}", " ", text).strip()
 
         # Step 3 — detect boolean operators
-        # Require uppercase AND/OR/NOT or explicit parentheses to distinguish from natural English 'and'
+        # Require uppercase AND/OR/NOT or explicit parentheses to distinguish
+        # from natural English 'and'/'or'
         has_explicit_boolean = bool(
             re.search(r"\b(AND|OR|NOT)\b", raw_query) or re.search(r"\([^\)]+\)", raw_query)
         )
@@ -175,7 +166,7 @@ class NLQueryParser:
             structured_query = re.sub(r"\band\b", " AND ", structured_query, flags=re.IGNORECASE)
             structured_query = re.sub(r"\bor\b", " OR ", structured_query, flags=re.IGNORECASE)
         elif has_explicit_boolean:
-            structured_query = raw_query  # preserve user's boolean expression
+            structured_query = raw_query  # preserve the user's boolean expression
 
         # Step 5 — VSM normalized query
         stemmed_terms = preprocess(text)

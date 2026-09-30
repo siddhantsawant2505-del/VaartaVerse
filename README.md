@@ -20,7 +20,7 @@ VaartaVerse/
 |---|---|---|---|
 | **`client`** | 3000 | Next.js 14, TypeScript, Tailwind CSS | Web UI: Search, Lineage Explorer, Divergence Matrix, Benchmark Dashboard |
 | **`server`** | 5000 | Node.js, Express, Mongoose, MongoDB | Tale metadata storage, Tale-type registry, Qrel benchmark judgments, Search logging |
-| **`ir_engine`** | 8000 | Python 3.11, FastAPI, NLTK, NumPy | Inverted Index, Boolean AST parser, TF-IDF VSM, Rocchio Feedback, Divergence, Evaluation |
+| **`ir_engine`** | 8000 | Python 3.12, FastAPI, NLTK, NumPy | Inverted Index, Boolean parser (NOT > AND > OR), TF-IDF VSM, BM25, Rocchio Feedback + PRF, Divergence, Evaluation |
 
 ---
 
@@ -33,42 +33,50 @@ The `ir_engine` is built with FastAPI and runs pure mathematical retrieval routi
 #### Core Algorithmic Modules (`ir_engine/app/core/`)
 
 * **`preprocessing.py`**: Text normalization pipeline.
-  * Lowers case and splits hyphenated words.
-  * Filters standard English stopwords + domain-specific terms (*"said"*, *"king"*, *"day"*, etc.).
+  * Lowers case, strips possessives (`"lion's"` → `"lion"`), and splits hyphenated words.
+  * Filters standard English stopwords + a small list of true discourse fillers (*"said"*, *"thus"*, …) — content words like *"king"* or *"well"* are deliberately kept searchable.
   * Applies **NLTK WordNet Lemmatizer** (noun `pos='n'` and verb `pos='v'` passes) to extract canonical dictionary roots (e.g., `"jackals"` → `"jackal"`, `"running"` → `"run"`).
 * **`inverted_index.py`**: Multi-zone posting list manager.
-  * Stores term frequencies ($tf$), document IDs, token positions, and field zones (`title`, `tradition`, `region`, `body`).
-  * Persists index structures on disk as JSON (`doc_registry.json`, `postings.json`).
+  * Stores term frequencies ($tf$), document IDs, token positions, and field zones (`title`, `body`).
+  * Persists index structures on disk as JSON (`doc_registry.json`, `postings.json`) with a **corpus fingerprint** — a stale index (corpus changed since last build) is detected and rebuilt automatically.
 * **`boolean_engine.py`**: Exact Boolean search parser.
-  * Recursive-descent AST parser supporting `AND`, `OR`, `NOT`, and parenthesized nested logic.
-  * Evaluates set operations over postings list document IDs.
+  * Recursive-descent parser with standard precedence (**NOT > AND > OR**), parenthesized nested logic, implicit AND via juxtaposition (`"jackal tiger"`), and juxtaposed NOT (`"jackal NOT tiger"`).
+  * Evaluates set operations over postings list document IDs, then **ranks the matching set by summed TF-IDF**.
+  * Malformed queries raise a precise parse error → the API returns **HTTP 422**; there are no silent fallbacks that invent results.
 * **`vsm_engine.py`**: Vector Space Model ranking engine.
   * Calculates sublinear term frequency: $w_{t,d} = 1 + \log(tf_{t,d})$ if $tf > 0$, else $0$.
-  * Calculates smoothed inverse document frequency: $idf_t = \log(N / df_t)$.
-  * Applies field zone weighting (e.g., title boost factor) and cosine similarity vector normalization.
-  * Performs top-$K$ document retrieval using min-heap priority queues.
+  * Calculates always-positive smoothed idf: $idf_t = \log(1 + N / df_t)$.
+  * Applies field zone weighting with **boost multipliers** (default title $2\times$ body $1\times$) and computes document norms over the **full document vector**, so a title match genuinely outranks a body match after cosine normalization.
+  * Performs top-$K$ document retrieval using heap-based selection.
+* **`bm25_engine.py`**: Okapi BM25 ranking — saturating TF ($k_1$), document-length normalization ($b$), always-positive BM25 idf, and a configurable title-zone boost. The classical baseline against the VSM.
 * **`relevance_feedback.py`**: Query expansion and re-ranking via Rocchio algorithm.
   * Refines search query vectors based on user-provided relevance judgments ($D_r$ vs $D_{nr}$):
     $$\vec{q}_{new} = \alpha \vec{q}_0 + \frac{\beta}{|D_r|} \sum_{\vec{d} \in D_r} \vec{d} - \frac{\gamma}{|D_{nr}|} \sum_{\vec{d} \in D_{nr}} \vec{d}$$
-  * Supports both explicit feedback and Pseudo-Relevance Feedback (PRF).
+  * Uses the same always-positive idf scheme as the VSM, clips negative weights, and re-ranks via a single postings traversal.
+  * Supports both explicit feedback and **Pseudo-Relevance Feedback (PRF)** — exposed at `POST /search/prf`.
 * **`nl_parser.py`**: Rule-based natural language parser.
   * Extracts named entities, traditions (*Panchatantra*, *Jataka*, *Hitopadesha*), and geographic regions from free-text inputs to automatically build structured search parameters.
 * **`divergence.py`**: Cross-regional textual evolution metrics.
   * Computes pairwise cosine similarity matrices across variants of the same ATU tale type.
   * Measures Jaccard coefficients and vocabulary overlap ratios to quantify narrative divergence.
 * **`evaluation.py`**: Benchmark quality evaluator.
-  * Benchmarks search queries against curated relevance judgment benchmark sets (`qrels`).
-  * Computes **Precision@K**, **Recall**, **Mean Average Precision (MAP)**, **nDCG@K**, and **F1 Score**.
+  * Benchmarks **boolean / vsm / bm25 / vsm_rocchio** retrieval modes against relevance judgments (`qrels`), injectable via constructor or a JSON file.
+  * Computes **Precision@K**, **Recall**, **per-query F1**, **Mean Average Precision (MAP)**, and **nDCG@K**; judgments referencing tale IDs missing from the corpus are filtered and counted.
+  * **Honesty notes:** the bundled stub qrels are author-judged over a small corpus (illustrative, not a benchmark), and boolean results are ranked post-hoc by TF-IDF — unranked boolean matching against ranked metrics will (correctly) look poor.
+  * The test suite (`tests/`, pytest) covers tokenization, boolean precedence, VSM/BM25 behavior, metric formulas, and the API surface.
 * **`ingestion.py`**: Corpus ingestion pipeline.
   * Ingests JSON document collections, executes preprocessing, and builds the inverted index.
 
 #### API Endpoints (`ir_engine/app/main.py`)
-* `GET /health`: Service health and index statistics.
-* `POST /search/vsm`: TF-IDF VSM vector ranking.
-* `POST /search/boolean`: Recursive Boolean search.
-* `POST /search/nl-query`: NL query parsing + search routing.
-* `POST /search/feedback`: Rocchio relevance feedback re-ranking.
-* `POST /evaluate`: Full dataset benchmark evaluation.
+* `GET /health`: Service health, index statistics, and index-staleness flag.
+* `POST /search/vsm`: TF-IDF VSM vector ranking with zone weighting.
+* `POST /search/bm25`: Okapi BM25 ranking (k1 / b / title_boost configurable).
+* `POST /search/boolean`: Boolean search (NOT > AND > OR); malformed queries → HTTP 422 with the parse error.
+* `POST /search/nl-query`: NL query parsing + search routing (falls back to ranked VSM when a parsed boolean query matches nothing, and reports it).
+* `POST /search/feedback`: Rocchio explicit relevance feedback re-ranking.
+* `POST /search/prf`: Pseudo-Relevance Feedback (blind feedback) via Rocchio.
+* `POST /evaluate`: Benchmark evaluation across retrieval modes with injectable qrels.
+* `GET /tale-types`: Tale-type registry with variant counts.
 * `GET /tale-type/{id}/divergence`: Pairwise divergence matrix computation.
 
 ---
@@ -97,14 +105,16 @@ The Node.js server acts as the data repository and API proxy.
 Next.js 14 frontend pages designed for research and comparative analysis:
 
 * **`/` (Search & IR Workbench)** (`client/src/app/page.tsx`):
-  * Interactive search interface supporting VSM, Boolean, and NL search tabs.
-  * Allows tuning field weight boosts and executing Rocchio relevance feedback re-ranking by toggling document relevance.
+  * Interactive search interface supporting Smart (NL/VSM), **BM25**, and Boolean search modes.
+  * Boolean parse errors (HTTP 422) are surfaced with the engine's exact message.
+  * Executes Rocchio relevance feedback re-ranking by toggling document relevance.
+  * All requests flow through the Express proxy (`:5000/api/ir`), which logs query metrics to MongoDB.
 * **`/tale-types` (Tale Types & Lineage Browser)** (`client/src/app/tale-types/page.tsx`):
   * Browse canonical ATU tale classifications, view core motifs, and list regional variants across traditions (*Panchatantra*, *Jataka*, etc.).
 * **`/divergence` (Comparative Divergence Matrix)** (`client/src/app/divergence/page.tsx`):
-  * Renders pairwise cosine similarity heatmaps, Jaccard distance, and vocabulary overlap matrices to visualize story evolution across regions.
+  * Renders **live** pairwise cosine similarity heatmaps, Jaccard similarity, and vocabulary overlap matrices fetched from the engine's `/tale-type/{id}/divergence` endpoint, with the tale-type registry loaded from `/tale-types`.
 * **`/evaluation` (IR Benchmark & Evaluation Dashboard)** (`client/src/app/evaluation/page.tsx`):
-  * Evaluation runner that executes benchmark queries against `qrels` and displays Precision@K, Recall, MAP, and nDCG@K metrics in real time.
+  * Evaluation runner that executes the benchmark against `qrels` and displays MAP, nDCG@10, P@5/P@10, Recall, and per-query F1 for Boolean, VSM, BM25, and Rocchio-PRF modes.
 
 ---
 

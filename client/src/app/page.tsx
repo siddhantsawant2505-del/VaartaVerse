@@ -55,7 +55,9 @@ const EXAMPLE_QUERIES = [
   { label: 'Mongoose', query: 'mongoose', bool: false },
 ];
 
-const IR_API = 'http://localhost:8000';
+// All search traffic goes through the Express proxy (:5000) which logs queries
+// to MongoDB, then forwards to the FastAPI IR engine (:8000).
+const IR_API = 'http://localhost:5000/api/ir';
 
 // ---------------------------------------------------------------------------
 // Component
@@ -64,6 +66,7 @@ const IR_API = 'http://localhost:8000';
 export default function SearchPage() {
   const [query, setQuery] = useState('');
   const [isBooleanMode, setIsBooleanMode] = useState(false);
+  const [isBm25Mode, setIsBm25Mode] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [results, setResults] = useState<TaleResult[]>([]);
   const [parsedInfo, setParsedInfo] = useState<ParsedInfo | null>(null);
@@ -75,15 +78,21 @@ export default function SearchPage() {
   // Search
   // -------------------------------------------------------------------------
 
-  const runSearch = async (q: string, bool: boolean) => {
+  const runSearch = async (q: string, bool: boolean, bm25: boolean) => {
     if (!q.trim()) return;
     setIsSearching(true);
     setErrorMsg('');
     setHasSearched(true);
 
     try {
-      const endpoint = bool ? `${IR_API}/search/boolean` : `${IR_API}/search/nl-query`;
-      const payload = bool ? { query: q } : { query: q, top_k: 10 };
+      const endpoint = bool
+        ? `${IR_API}/search/boolean`
+        : bm25
+        ? `${IR_API}/search/bm25`
+        : `${IR_API}/search/nl-query`;
+      const payload = bool
+        ? { query: q }
+        : { query: q, top_k: 10 };
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -92,7 +101,18 @@ export default function SearchPage() {
       });
 
       if (!res.ok) {
-        setErrorMsg(`Engine error: ${res.status} ${res.statusText}`);
+        // Surface the engine's real error (e.g. boolean parse errors → 422)
+        let detail = `${res.status} ${res.statusText}`;
+        try {
+          const body = await res.json();
+          const d = body?.detail;
+          if (typeof d === 'string') detail = d;
+          else if (d?.message) detail = d.message;
+          else if (Array.isArray(d) && d[0]?.msg) detail = d[0].msg;
+        } catch {
+          /* keep status text */
+        }
+        setErrorMsg(`Engine error: ${detail}`);
         return;
       }
 
@@ -109,7 +129,7 @@ export default function SearchPage() {
         });
       } else {
         setParsedInfo({
-          mode: bool ? 'boolean' : 'vsm',
+          mode: bool ? 'boolean' : bm25 ? 'bm25' : 'vsm',
           normalized_query: q,
           stems: q.toLowerCase().split(/\s+/).filter(Boolean),
           entities: { traditions: [], regions: [], atu_codes: [] },
@@ -134,7 +154,7 @@ export default function SearchPage() {
 
       setResults(mapped);
     } catch (err) {
-      setErrorMsg('Cannot reach the IR engine. Make sure it is running at localhost:8000.');
+      setErrorMsg('Cannot reach the search service. Make sure the server (:5000) and IR engine (:8000) are running.');
     } finally {
       setIsSearching(false);
     }
@@ -142,13 +162,14 @@ export default function SearchPage() {
 
   const handleSubmit = (e?: React.FormEvent) => {
     e?.preventDefault();
-    runSearch(query, isBooleanMode);
+    runSearch(query, isBooleanMode, isBm25Mode);
   };
 
   const handleExample = (q: string, bool: boolean) => {
     setQuery(q);
     setIsBooleanMode(bool);
-    runSearch(q, bool);
+    setIsBm25Mode(false);
+    runSearch(q, bool, false);
   };
 
   // -------------------------------------------------------------------------
@@ -229,9 +250,9 @@ export default function SearchPage() {
       <div className="flex justify-center">
         <div className="inline-flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1">
           <button
-            onClick={() => setIsBooleanMode(false)}
+            onClick={() => { setIsBooleanMode(false); setIsBm25Mode(false); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${
-              !isBooleanMode
+              !isBooleanMode && !isBm25Mode
                 ? 'bg-amber-500 text-slate-950 shadow font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
@@ -240,7 +261,18 @@ export default function SearchPage() {
             Smart Search
           </button>
           <button
-            onClick={() => setIsBooleanMode(true)}
+            onClick={() => { setIsBooleanMode(false); setIsBm25Mode(true); }}
+            className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${
+              isBm25Mode
+                ? 'bg-amber-500 text-slate-950 shadow font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            BM25
+          </button>
+          <button
+            onClick={() => { setIsBooleanMode(true); setIsBm25Mode(false); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${
               isBooleanMode
                 ? 'bg-amber-500 text-slate-950 shadow font-semibold'
@@ -257,6 +289,8 @@ export default function SearchPage() {
       <p className="text-center text-xs text-slate-500">
         {isBooleanMode
           ? 'Use AND, OR, NOT and parentheses — e.g. (jackal OR fox) AND lion AND NOT tiger'
+          : isBm25Mode
+          ? 'BM25 ranking: saturating term frequency, length normalization, title boost'
           : 'Type anything naturally — a keyword, a character, a place, or a full sentence'}
       </p>
 

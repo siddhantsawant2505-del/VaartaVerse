@@ -3,16 +3,21 @@ vsm_engine.py — VaartaVerse Classical IR Engine
 ================================================
 Vector Space Model (VSM) with TF-IDF scoring and zone/field weighting.
 
-Scoring formula per document d for query q:
-    score(q, d) = Σ_t [ tf_weight(t,d,zone) × idf(t) × tf_idf_query(t,q) ]
+Scoring: cosine similarity between query and document TF-IDF vectors.
 
-Where:
-    tf_weight(t, d, zone) = (1 + log(tf_t_d)) × (w_title × tf_title + w_body × tf_body)
-    idf(t)                = log((N + 1) / (df_t + 1))   [smoothed]
-    cosine_sim            = dot(q_vec, d_vec) / (|q_vec| × |d_vec|)
+    idf(t)               = log(1 + N / df_t)            (always > 0, even df = N)
+    tf_weight(tf)        = 1 + log(tf)                  (sublinear scaling)
+    doc weight w(t,d)    = (w_title·tfw(title_tf) + w_body·tfw(body_tf)) × idf(t)
+    query weight w(t,q)  = tfw(qtf) × idf(t)
+    cosine(q, d)         = dot(q, d) / (|q| × |d|)
 
-Zone weights are configurable per-request (default: title=0.35, body=0.65).
-Top-K retrieval uses a max-heap for efficiency.
+Zone weighting note: document norms are computed over the FULL document vector
+(all indexed terms for the doc), not just query terms. This is what makes the
+title boost survive cosine normalization — a title match genuinely outranks an
+equivalent body match. Norms are cached per zone-weight configuration.
+
+No silent fallbacks: a query with no indexable terms returns [] (the API layer
+pre-validates and returns HTTP 422 for stopword-only queries).
 """
 
 import heapq
@@ -22,6 +27,11 @@ from typing import Optional
 
 from app.core.inverted_index import InvertedIndex
 from app.core.preprocessing import preprocess
+
+# Zone weights are BOOST MULTIPLIERS (title matches count 2x body matches),
+# not a weight distribution. With the original 0.35/0.65 "distribution" a body
+# match outranked a title match — the opposite of the documented "title boost".
+DEFAULT_ZONE_WEIGHTS = {"title": 2.0, "body": 1.0}
 
 
 def _sublinear_tf(tf: int) -> float:
@@ -40,9 +50,43 @@ class VSMEngine:
 
     def __init__(self, index: InvertedIndex):
         self._index = index
+        # (N, title_w, body_w) → {doc_id: full-vector norm}
+        self._doc_norm_cache: dict[tuple[float, float, float], dict[str, float]] = {}
 
     # ------------------------------------------------------------------
-    # Public Interface
+    # Document norms (full-vector, zone-weighted, cached)
+    # ------------------------------------------------------------------
+
+    def _doc_norms(self, title_w: float, body_w: float) -> dict[str, float]:
+        """
+        Cosine denominator per document: |d| over the FULL document TF-IDF
+        vector with zone weighting. Cached per (N, title_w, body_w); cache is
+        invalidated when the API layer resets engine singletons after ingestion.
+        """
+        N = self._index.doc_count()
+        key = (float(N), float(title_w), float(body_w))
+        cached = self._doc_norm_cache.get(key)
+        if cached is not None:
+            return cached
+
+        sq: dict[str, float] = {}
+        for term, postings in self._index.postings_items():
+            df = len(postings)
+            if df == 0:
+                continue
+            idf = math.log(1.0 + N / df)
+            for doc_id, entry in postings.items():
+                tf_title = len(entry.zones.get("title", []))
+                tf_body = len(entry.zones.get("body", []))
+                w = (title_w * _sublinear_tf(tf_title) + body_w * _sublinear_tf(tf_body)) * idf
+                sq[doc_id] = sq.get(doc_id, 0.0) + w * w
+
+        norms = {doc_id: math.sqrt(v) for doc_id, v in sq.items() if v > 0}
+        self._doc_norm_cache[key] = norms
+        return norms
+
+    # ------------------------------------------------------------------
+    # Public search
     # ------------------------------------------------------------------
 
     def search(
@@ -56,18 +100,16 @@ class VSMEngine:
         """
         Rank documents by cosine similarity to query using TF-IDF with zone weighting.
 
-        Returns top_k results sorted by descending score.
+        Returns top_k results sorted by descending score. Empty list if the
+        query has no indexable terms or the index is empty.
         """
-        if zone_weights is None:
-            zone_weights = {"title": 0.35, "body": 0.65}
+        zw = dict(zone_weights) if zone_weights else dict(DEFAULT_ZONE_WEIGHTS)
+        title_w = float(zw.get("title", 2.0))
+        body_w = float(zw.get("body", 1.0))
 
         query_terms = preprocess(query)
         if not query_terms:
-            # Fallback for stopword-only or punctuation inputs: keep raw alphanumeric words
-            import re
-            query_terms = [t.lower() for t in re.findall(r"\b[a-zA-Z0-9]+\b", query) if len(t) > 1]
-            if not query_terms:
-                return []
+            return []
 
         N = self._index.doc_count()
         if N == 0:
@@ -83,86 +125,59 @@ class VSMEngine:
             df = self._index.get_df(term)
             if df == 0:
                 continue
-            idf = math.log((N + 1) / (df + 1))
+            idf = math.log(1.0 + N / df)
             query_vec[term] = _sublinear_tf(tf) * idf
 
-        # If no exact terms match the index vocabulary, try prefix / substring fallback
         if not query_vec:
-            vocab = self._index.vocabulary()
-            for term in query_tf:
-                if len(term) < 3:
-                    continue
-                matches = [v for v in vocab if term in v or (len(v) >= 4 and v in term)]
-                for v in matches[:4]:
-                    df = self._index.get_df(v)
-                    if df > 0 and v not in query_vec:
-                        idf = math.log((N + 1) / (df + 1))
-                        query_vec[v] = _sublinear_tf(1) * idf * 0.75
+            return []  # no query term exists in the vocabulary
 
-        if not query_vec:
+        q_norm = math.sqrt(sum(w ** 2 for w in query_vec.values()))
+        if q_norm == 0:
             return []
 
-        # Accumulate scores per document (inverted-index traversal)
-        scores: dict[str, float] = {}
-        doc_vec_sq_norms: dict[str, float] = {}
-
+        # Accumulate dot products per document (inverted-index traversal)
+        dots: dict[str, float] = {}
         for term, q_weight in query_vec.items():
             postings = self._index.get_postings(term)
+            df = len(postings)
+            idf = math.log(1.0 + N / df)
             for doc_id, entry in postings.items():
                 meta = self._index.get_doc_meta(doc_id)
                 if meta is None:
                     continue
-                # Apply corpus metadata filters
                 if collection_filter and collection_filter.lower() not in meta.source_collection.lower():
                     continue
                 if region_filter and region_filter.lower() not in meta.region.lower():
                     continue
 
-                # Zone-weighted TF
-                title_positions = entry.zones.get("title", []) if isinstance(entry.zones, dict) else []
-                body_positions = entry.zones.get("body", []) if isinstance(entry.zones, dict) else []
-                tf_title = len(title_positions) if isinstance(title_positions, list) else 0
-                tf_body = len(body_positions) if isinstance(body_positions, list) else (entry.tf - tf_title)
+                tf_title = len(entry.zones.get("title", []))
+                tf_body = len(entry.zones.get("body", []))
+                d_weight = (title_w * _sublinear_tf(tf_title) + body_w * _sublinear_tf(tf_body)) * idf
+                dots[doc_id] = dots.get(doc_id, 0.0) + q_weight * d_weight
 
-                zone_score = (
-                    zone_weights.get("title", 0.35) * _sublinear_tf(tf_title)
-                    + zone_weights.get("body", 0.65) * _sublinear_tf(tf_body)
-                )
-
-                df = self._index.get_df(term)
-                idf = math.log((N + 1) / (df + 1))
-                d_weight = zone_score * idf
-
-                scores[doc_id] = scores.get(doc_id, 0.0) + q_weight * d_weight
-                doc_vec_sq_norms[doc_id] = doc_vec_sq_norms.get(doc_id, 0.0) + d_weight ** 2
-
-        # Cosine normalization
-        q_norm = math.sqrt(sum(w ** 2 for w in query_vec.values()))
-        if q_norm == 0:
-            return []
-
+        # Cosine normalization against full document norms
+        doc_norms = self._doc_norms(title_w, body_w)
         cosine_scores: dict[str, float] = {}
-        for doc_id, dot in scores.items():
-            d_norm = math.sqrt(doc_vec_sq_norms.get(doc_id, 1.0))
-            if d_norm == 0:
+        for doc_id, dot in dots.items():
+            d_norm = doc_norms.get(doc_id)
+            if not d_norm:
                 continue
             cosine_scores[doc_id] = dot / (q_norm * d_norm)
 
-        # Top-K via max-heap
         top = heapq.nlargest(top_k, cosine_scores.items(), key=lambda x: x[1])
 
         results = []
         for doc_id, score in top:
             meta = self._index.get_doc_meta(doc_id)
-            if meta:
-                result = asdict(meta)
-                result["score"] = round(score, 6)
-                result["zone_weights"] = zone_weights
-                # Matched stems for snippet highlighting (doc_id in postings of term)
-                result["terms_matched"] = [
-                    t for t in query_vec if doc_id in self._index.get_postings(t)
-                ]
-                results.append(result)
+            if meta is None:
+                continue
+            result = asdict(meta)
+            result["score"] = round(score, 6)
+            result["zone_weights"] = {"title": title_w, "body": body_w}
+            result["terms_matched"] = [
+                t for t in query_vec if doc_id in self._index.get_postings(t)
+            ]
+            results.append(result)
 
         return results
 
@@ -170,18 +185,20 @@ class VSMEngine:
         """
         Return the full TF-IDF vector for a document as {term: weight}.
         Used by Rocchio feedback and divergence computation.
+
+        Note: O(vocabulary) per call — acceptable at demo-corpus scale;
+        precompute and cache if the corpus grows beyond a few thousand docs.
         """
         N = self._index.doc_count()
         if N == 0:
             return {}
 
         vec: dict[str, float] = {}
-        for term in self._index.vocabulary():
-            postings = self._index.get_postings(term)
-            if doc_id not in postings:
+        for term, postings in self._index.postings_items():
+            entry = postings.get(doc_id)
+            if entry is None:
                 continue
-            tf = postings[doc_id].tf
-            df = self._index.get_df(term)
-            idf = math.log((N + 1) / (df + 1))
-            vec[term] = _sublinear_tf(tf) * idf
+            df = len(postings)
+            idf = math.log(1.0 + N / df)
+            vec[term] = _sublinear_tf(entry.tf) * idf
         return vec

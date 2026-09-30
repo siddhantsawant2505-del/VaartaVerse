@@ -20,7 +20,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from app.core.inverted_index import InvertedIndex
+from app.core.inverted_index import InvertedIndex, corpus_fingerprint
 from app.core.preprocessing import preprocess
 
 load_dotenv()
@@ -158,8 +158,8 @@ class IngestionPipeline:
             return self.ingest_from_json()
 
     def save_index(self) -> None:
-        """Persist the built index to disk."""
-        self._index.save()
+        """Persist the built index to disk (with corpus fingerprint for staleness checks)."""
+        self._index.save(corpus_path=CORPUS_PATH)
 
     @property
     def stats(self) -> dict:

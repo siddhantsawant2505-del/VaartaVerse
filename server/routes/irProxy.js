@@ -56,6 +56,28 @@ router.post('/search/vsm', async (req, res) => {
   }).catch(() => {});
 });
 
+// POST /api/ir/search/bm25
+router.post('/search/bm25', async (req, res) => {
+  const start = Date.now();
+  await proxyToIR('/search/bm25', req.body, res);
+  QueryLog.create({
+    query_text: req.body.query,
+    query_mode: 'bm25',
+    execution_time_ms: Date.now() - start,
+  }).catch(() => {});
+});
+
+// POST /api/ir/search/prf (pseudo-relevance feedback)
+router.post('/search/prf', async (req, res) => {
+  const start = Date.now();
+  await proxyToIR('/search/prf', req.body, res);
+  QueryLog.create({
+    query_text: req.body.query,
+    query_mode: 'prf',
+    execution_time_ms: Date.now() - start,
+  }).catch(() => {});
+});
+
 // POST /api/ir/search/nl-query
 router.post('/search/nl-query', async (req, res) => {
   const start = Date.now();
@@ -92,6 +114,30 @@ router.get('/tale-type/:id/divergence', async (req, res) => {
   try {
     const fetchFn = await getFetch();
     const response = await fetchFn(`${IR_ENGINE_URL}/tale-type/${req.params.id}/divergence`);
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (err) {
+    res.status(502).json({ error: `IR Engine unreachable: ${err.message}` });
+  }
+});
+
+// GET /api/ir/tale-types — tale-type registry with variant counts
+router.get('/tale-types', async (req, res) => {
+  try {
+    const fetchFn = await getFetch();
+    const response = await fetchFn(`${IR_ENGINE_URL}/tale-types`);
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (err) {
+    res.status(502).json({ error: `IR Engine unreachable: ${err.message}` });
+  }
+});
+
+// GET /api/ir/health — IR engine health probe
+router.get('/health', async (req, res) => {
+  try {
+    const fetchFn = await getFetch();
+    const response = await fetchFn(`${IR_ENGINE_URL}/health`);
     const data = await response.json();
     res.status(response.status).json(data);
   } catch (err) {

@@ -4,18 +4,18 @@ preprocessing.py — VaartaVerse Classical IR Pipeline
 Handles all text normalization before indexing and querying.
 
 Pipeline:
-    raw_text → lowercase → tokenize → stopword removal → WordNet Lemmatization → tokens
+    raw_text → lowercase → apostrophe/possessive handling → tokenize
+             → stopword removal → WordNet Lemmatization → tokens
 
 No external NLP LLM or embeddings — rule-based linguistic processing.
 """
 
 import re
-import string
 from typing import Optional
 
 import nltk
 from nltk.stem import WordNetLemmatizer
-from nltk.corpus import stopwords, wordnet
+from nltk.corpus import stopwords
 
 # Download required NLTK corpora on startup (idempotent)
 for resource in ("stopwords", "wordnet", "omw-1.4"):
@@ -52,12 +52,22 @@ ALL_STOPWORDS = _ENGLISH_STOPS | _DOMAIN_STOPS
 
 def tokenize(text: str) -> list[str]:
     """
-    Split text on whitespace and punctuation, lowercase all tokens.
-    Replaces hyphens with spaces for compound words.
+    Normalize and split text into lowercase word tokens.
+
+    - Lowers case.
+    - Strips English possessive 's / ' (so "lion's" matches a query for "lion").
+    - Replaces hyphens with spaces for compound words ("well-deep" → "well deep").
+    - Splits on whitespace and punctuation.
+
+    Note: apostrophes in contractions are handled by stripping the clitic
+    suffix ("lion's" → "lion", "dogs'" → "dogs"). This dramatically improves
+    recall on narrative text, which is full of possessives.
     """
     text = text.lower()
+    # Possessives and plural apostrophes: "lion's" → "lion", "dogs'" → "dogs"
+    text = re.sub(r"['’]s?\b", "", text)
     text = text.replace("-", " ")
-    tokens = re.findall(r"\b[a-z']+\b", text)
+    tokens = re.findall(r"\b[a-z]+\b", text)
     return tokens
 
 

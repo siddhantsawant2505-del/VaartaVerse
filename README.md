@@ -72,7 +72,7 @@ The `ir_engine` is built with FastAPI and runs pure mathematical retrieval routi
 * `POST /search/vsm`: TF-IDF VSM vector ranking with zone weighting.
 * `POST /search/bm25`: Okapi BM25 ranking (k1 / b / title_boost configurable).
 * `POST /search/boolean`: Boolean search (NOT > AND > OR); malformed queries → HTTP 422 with the parse error.
-* `POST /search/nl-query`: NL query parsing + search routing (falls back to ranked VSM when a parsed boolean query matches nothing, and reports it).
+* `POST /search/nl-query`: NL query parsing + search routing (falls back to ranked VSM when a parsed boolean query matches nothing, and reports it). Accepts `expand_synonyms` (bool, default false), `expansion_weight` (default 0.3), and `max_expansions` (default 3); applied synonyms are reported in `synonyms_applied` and per-result `expansions_matched`.
 * `POST /search/feedback`: Rocchio explicit relevance feedback re-ranking.
 * `POST /search/prf`: Pseudo-Relevance Feedback (blind feedback) via Rocchio.
 * `POST /evaluate`: Benchmark evaluation across retrieval modes with injectable qrels.

@@ -41,6 +41,7 @@ interface ParsedInfo {
   normalized_query: string;
   stems: string[];
   entities: { traditions: string[]; regions: string[]; atu_codes: string[] };
+  expansions: Record<string, string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -48,16 +49,30 @@ interface ParsedInfo {
 // ---------------------------------------------------------------------------
 
 const EXAMPLE_QUERIES = [
-  { label: 'Jackal & Lion', query: 'jackal lion well', bool: false },
-  { label: 'Monkey & Crocodile', query: 'monkey crocodile river', bool: false },
-  { label: 'Panchatantra', query: 'Show Panchatantra tales about a clever hare', bool: false },
-  { label: 'Boolean: Fox or Jackal', query: '(jackal OR fox) AND lion AND NOT tiger', bool: true },
-  { label: 'Mongoose', query: 'mongoose', bool: false },
+  { label: 'Akbar & Birbal', query: 'Birbal cooking khichdi cold lake', bool: false },
+  { label: 'Tenali Rama', query: 'Tenali Raman and Persian horse trader', bool: false },
+  { label: 'Ramayana', query: 'Hanuman brings Sanjeevani mountain for Lakshmana', bool: false },
+  { label: 'Mahabharata', query: 'Yaksha Prashna riddles of the pool Yudhishthira', bool: false },
+  { label: 'Ekalavya', query: 'Ekalavya archery thumb guru dakshina', bool: false },
+  { label: 'Blue Jackal', query: 'blue jackal indigo vat forest king', bool: false },
+  { label: 'Brahmin & Mongoose', query: 'brahmin mongoose snake baby', bool: false },
+  { label: 'Boolean: Fox or Jackal', query: '(jackal OR hare) AND lion AND NOT tiger', bool: true },
 ];
 
-// All search traffic goes through the Express proxy (:5000) which logs queries
-// to MongoDB, then forwards to the FastAPI IR engine (:8000).
-const IR_API = 'http://localhost:5000/api/ir';
+const IR_APIS = ['http://localhost:8000', 'http://localhost:5000/api/ir'];
+
+async function fetchWithFallback(path: string, options: RequestInit) {
+  let lastError: any = null;
+  for (const base of IR_APIS) {
+    try {
+      const res = await fetch(`${base}${path}`, options);
+      return res;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -67,6 +82,7 @@ export default function SearchPage() {
   const [query, setQuery] = useState('');
   const [isBooleanMode, setIsBooleanMode] = useState(false);
   const [isBm25Mode, setIsBm25Mode] = useState(false);
+  const [expandSynonyms, setExpandSynonyms] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [results, setResults] = useState<TaleResult[]>([]);
   const [parsedInfo, setParsedInfo] = useState<ParsedInfo | null>(null);
@@ -85,16 +101,16 @@ export default function SearchPage() {
     setHasSearched(true);
 
     try {
-      const endpoint = bool
-        ? `${IR_API}/search/boolean`
+      const path = bool
+        ? '/search/boolean'
         : bm25
-        ? `${IR_API}/search/bm25`
-        : `${IR_API}/search/nl-query`;
+        ? '/search/bm25'
+        : '/search/nl-query';
       const payload = bool
         ? { query: q }
-        : { query: q, top_k: 10 };
+        : { query: q, top_k: 10, expand_synonyms: expandSynonyms };
 
-      const res = await fetch(endpoint, {
+      const res = await fetchWithFallback(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -126,6 +142,7 @@ export default function SearchPage() {
           normalized_query: p.normalized_query || q,
           stems: p.stemmed_terms || (p.normalized_query ? p.normalized_query.split(/\s+/).filter(Boolean) : []),
           entities: p.entities || { traditions: [], regions: [], atu_codes: [] },
+          expansions: p.expansions || {},
         });
       } else {
         setParsedInfo({
@@ -133,6 +150,7 @@ export default function SearchPage() {
           normalized_query: q,
           stems: q.toLowerCase().split(/\s+/).filter(Boolean),
           entities: { traditions: [], regions: [], atu_codes: [] },
+          expansions: {},
         });
       }
 
@@ -191,7 +209,7 @@ export default function SearchPage() {
   const applyRocchio = async () => {
     setIsSearching(true);
     try {
-      const res = await fetch(`${IR_API}/search/feedback`, {
+      const res = await fetchWithFallback('/search/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, relevant_ids: relevantIds, non_relevant_ids: nonRelevantIds, top_k: 10 }),
@@ -321,8 +339,8 @@ export default function SearchPage() {
           </button>
         </div>
 
-        {/* Example chips */}
-        <div className="flex flex-wrap gap-2 justify-center">
+        {/* Example chips + synonym toggle */}
+        <div className="flex flex-wrap gap-2 justify-center items-center">
           <span className="text-xs text-slate-500 self-center mr-1">Examples:</span>
           {EXAMPLE_QUERIES.map((ex) => (
             <button
@@ -339,6 +357,21 @@ export default function SearchPage() {
               {ex.label}
             </button>
           ))}
+          {!isBooleanMode && (
+            <label
+              className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none ml-2 px-3 py-1 rounded-full border border-slate-800 bg-slate-900 hover:border-emerald-700/50 transition-all"
+              title="Expand query terms with WordNet synonyms (weighted below your original words)"
+            >
+              <input
+                type="checkbox"
+                checked={expandSynonyms}
+                onChange={(e) => setExpandSynonyms(e.target.checked)}
+                className="accent-emerald-500 w-3.5 h-3.5"
+              />
+              <Sparkles className="w-3 h-3 text-emerald-400" />
+              Synonym expansion
+            </label>
+          )}
         </div>
       </form>
 
@@ -398,6 +431,20 @@ export default function SearchPage() {
               <span className="text-slate-500 self-center">Stems:</span>
               {parsedInfo.stems.map((s) => (
                 <span key={s} className="bg-slate-800 px-2 py-0.5 rounded text-amber-300">{s}</span>
+              ))}
+            </div>
+          )}
+          {Object.keys(parsedInfo.expansions).length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              <span className="text-slate-500 self-center">Synonyms (0.3×):</span>
+              {Object.entries(parsedInfo.expansions).map(([term, syns]) => (
+                <span key={term} className="flex items-center gap-0.5">
+                  <span className="bg-slate-800 px-2 py-0.5 rounded text-amber-300">{term}</span>
+                  <span className="text-slate-600">→</span>
+                  {syns.map((syn) => (
+                    <span key={syn} className="bg-emerald-900/40 border border-emerald-700/40 px-2 py-0.5 rounded text-emerald-300">{syn}</span>
+                  ))}
+                </span>
               ))}
             </div>
           )}

@@ -96,9 +96,20 @@ class VSMEngine:
         zone_weights: Optional[dict] = None,
         collection_filter: Optional[str] = None,
         region_filter: Optional[str] = None,
+        expansion_weights: Optional[dict[str, float]] = None,
     ) -> list[dict]:
         """
         Rank documents by cosine similarity to query using TF-IDF with zone weighting.
+
+        Args:
+            query:             Raw query text.
+            top_k:             Number of results.
+            zone_weights:      Title/body boost multipliers.
+            collection_filter: Substring filter on source_collection.
+            region_filter:     Substring filter on region.
+            expansion_weights: Optional {stemmed_term: weight} entries added to the
+                               query vector (e.g. WordNet synonyms at 0.3x).
+                               Terms absent from the index are ignored.
 
         Returns top_k results sorted by descending score. Empty list if the
         query has no indexable terms or the index is empty.
@@ -108,7 +119,7 @@ class VSMEngine:
         body_w = float(zw.get("body", 1.0))
 
         query_terms = preprocess(query)
-        if not query_terms:
+        if not query_terms and not expansion_weights:
             return []
 
         N = self._index.doc_count()
@@ -128,6 +139,16 @@ class VSMEngine:
             idf = math.log(1.0 + N / df)
             query_vec[term] = _sublinear_tf(tf) * idf
 
+        # Merge expansion terms (synonyms) at their provided weights (0 < w ≤ 1).
+        # Expansion terms never override an original query term already present.
+        if expansion_weights:
+            for term, weight in expansion_weights.items():
+                if term not in query_vec:
+                    df = self._index.get_df(term)
+                    if df > 0:
+                        idf = math.log(1.0 + N / df)
+                        query_vec[term] = float(weight) * idf
+
         if not query_vec:
             return []  # no query term exists in the vocabulary
 
@@ -145,8 +166,10 @@ class VSMEngine:
                 meta = self._index.get_doc_meta(doc_id)
                 if meta is None:
                     continue
-                if collection_filter and collection_filter.lower() not in meta.source_collection.lower():
-                    continue
+                if collection_filter:
+                    cf = collection_filter.lower()
+                    if cf not in meta.source_collection.lower() and cf not in meta.tradition.lower():
+                        continue
                 if region_filter and region_filter.lower() not in meta.region.lower():
                     continue
 
@@ -166,6 +189,7 @@ class VSMEngine:
 
         top = heapq.nlargest(top_k, cosine_scores.items(), key=lambda x: x[1])
 
+        expansion_set = set(expansion_weights or {})
         results = []
         for doc_id, score in top:
             meta = self._index.get_doc_meta(doc_id)
@@ -174,9 +198,12 @@ class VSMEngine:
             result = asdict(meta)
             result["score"] = round(score, 6)
             result["zone_weights"] = {"title": title_w, "body": body_w}
-            result["terms_matched"] = [
+            matched = [
                 t for t in query_vec if doc_id in self._index.get_postings(t)
             ]
+            result["terms_matched"] = matched
+            # Report which expansions actually fired on this doc
+            result["expansions_matched"] = sorted(set(matched) & expansion_set)
             results.append(result)
 
         return results

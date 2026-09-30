@@ -9,14 +9,16 @@ Pipeline:
     2. Entity extraction: known regions, traditions, tale-type codes from lexicon
     3. Stop phrase removal: strip filler ("find me", "show tales about", "which stories")
     4. Query expansion: attach region/tradition filters if recognised
-    5. Query routing: decide boolean vs VSM based on structure
+    5. Optional WordNet synonym expansion (see query_expansion.py) — expansion
+       terms are reported in the parsed payload and weighted below the original
+       query terms during retrieval
+    6. Query routing: decide boolean vs VSM based on structure
 
 Example:
     "stories about clever jackal tricking a lion in Panchatantra"
     → mode: vsm
     → normalized_query: "clever jackal trick lion panchatantra"
-    → filters: {tradition: "Panchatantra"}   (Panchatantra stays in the text too,
-      so "baital riddles" still ranks the Baital tales by content terms)
+    → filters: {tradition: "Panchatantra"}
 
     "tales with lion AND jackal but not tiger"
     → mode: boolean
@@ -27,6 +29,7 @@ import re
 from typing import Optional
 
 from app.core.preprocessing import preprocess, tokenize
+from app.core.query_expansion import expand_terms
 
 # ---------------------------------------------------------------------------
 # Lexicons — extended as corpus grows
@@ -98,9 +101,21 @@ class NLQueryParser:
     Rule-based NL parser that converts free-text queries into structured IR queries.
     """
 
-    def parse(self, raw_query: str) -> dict:
+    def parse(
+        self,
+        raw_query: str,
+        expand_synonyms: bool = False,
+        vocabulary: Optional[set] = None,
+    ) -> dict:
         """
         Parse a natural-language query.
+
+        Args:
+            raw_query:       The user's free-text query.
+            expand_synonyms: Add WordNet synonyms to the VSM query (off by default).
+                             Only applied for VSM mode; boolean semantics must
+                             stay exact.
+            vocabulary:      Index vocabulary to filter synonyms against.
 
         Returns:
             {
@@ -108,13 +123,11 @@ class NLQueryParser:
                 "original_query": str,
                 "normalized_query": str,      # cleaned for VSM retrieval
                 "structured_query": str,      # boolean expression if mode=boolean
-                "entities": {
-                    "traditions": list[str],
-                    "regions": list[str],
-                    "atu_codes": list[str],
-                },
+                "entities": {...},
                 "filters": dict,
                 "stemmed_terms": list[str],
+                "expansions": {term: [synonyms]},   # empty unless expansion enabled
+                "expanded_terms": list[str],        # flat synonym list actually used
             }
         """
         text = raw_query.strip().lower()
@@ -123,25 +136,24 @@ class NLQueryParser:
         for pattern in FILLER_PATTERNS:
             text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
 
-        # Step 2 — extract entities (words are KEPT in the text; see module docstring)
+        # Step 2 — extract entities (words are KEPT in the text; see module docstring).
+        # Dedupe canonical values — e.g. "baital pachisi" matches two lexicon keys
+        # that map to the same tradition.
         traditions_found = []
         regions_found = []
         atu_codes_found = []
 
         for keyword, canonical in KNOWN_TRADITIONS.items():
-            if keyword in text:
+            if keyword in text and canonical not in traditions_found:
                 traditions_found.append(canonical)
-                # text = text.replace(keyword, "")  # keep the word — it's content
 
         for keyword, canonical in KNOWN_REGIONS.items():
-            if keyword in text:
+            if keyword in text and canonical not in regions_found:
                 regions_found.append(canonical)
-                # text = text.replace(keyword, "")  # keep the word — it's content
 
         for pattern, code in KNOWN_ATU_CODES.items():
-            if re.search(pattern, text, re.IGNORECASE):
+            if re.search(pattern, text, re.IGNORECASE) and code not in atu_codes_found:
                 atu_codes_found.append(code)
-                # do not remove — ATU codes are content too
 
         text = re.sub(r"\s{2,}", " ", text).strip()
 
@@ -172,13 +184,18 @@ class NLQueryParser:
         stemmed_terms = preprocess(text)
         normalized_query = " ".join(stemmed_terms)
 
+        # Step 6 — optional WordNet synonym expansion (VSM mode only)
+        expansions: dict[str, list[str]] = {}
+        if expand_synonyms and mode == "vsm" and stemmed_terms:
+            expansions = expand_terms(stemmed_terms, vocabulary=vocabulary)
+
         filters: dict = {}
         if traditions_found:
             filters["tradition"] = traditions_found[0]
         if regions_found:
             filters["region"] = regions_found[0]
         if atu_codes_found:
-            filters["tale_type"] = atu_codes_found[0]
+            filters["tale_type"] = filters.get("tale_type") or atu_codes_found[0]
 
         return {
             "mode": mode,
@@ -192,4 +209,6 @@ class NLQueryParser:
             },
             "filters": filters,
             "stemmed_terms": stemmed_terms,
+            "expansions": expansions,
+            "expanded_terms": [s for syns in expansions.values() for s in syns],
         }

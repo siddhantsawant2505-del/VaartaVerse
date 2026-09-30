@@ -38,7 +38,8 @@ ir_engine/
 | `vsm_engine.py` | TF-IDF ($1 + \log tf$) with always-positive IDF ($\log(1 + N/df)$), title/body boost multipliers, full-vector-norm cosine scoring. |
 | `bm25_engine.py` | Okapi BM25 with saturating TF ($k_1$), length normalization ($b$), and title-zone boost. |
 | `relevance_feedback.py` | Rocchio query reformulation for explicit feedback and PRF, single-pass postings re-ranking. |
-| `nl_parser.py` | Rule-based parser mapping NL queries to structured VSM/Boolean search parameters. |
+| `nl_parser.py` | Rule-based parser mapping NL queries to structured VSM/Boolean search parameters, with optional WordNet synonym expansion. |
+| `query_expansion.py` | WordNet synonym expansion: POS-priority (n → a → v), multi-word lemma exclusion, in-vocabulary filtering; synonyms weighted below original terms (default 0.3×). |
 | `divergence.py` | Calculates pairwise divergence matrices, Jaccard similarity, and vocabulary overlap across variants. |
 | `evaluation.py` | P@K, Recall, per-query F1, MAP, nDCG@K against injectable `qrels` across boolean/vsm/bm25/vsm_rocchio modes. |
 | `ingestion.py` | Processes text documents and constructs the inverted index on disk. |
@@ -64,4 +65,4 @@ FastAPI interactive documentation will be available at **http://localhost:8000/d
 python -m pytest tests/ -v
 ```
 
-The suite covers tokenization/possessives, boolean precedence and error handling, VSM zone weighting and idf edge cases, BM25 behavior, metric formulas (hand-computed expectations), index persistence/fingerprints, and the FastAPI surface (including HTTP 422 parse errors).
+The suite covers tokenization/possessives, boolean precedence and error handling, VSM zone weighting and idf edge cases, BM25 behavior, metric formulas (hand-computed expectations), WordNet expansion (module, VSM integration, API toggle), index persistence/fingerprints, and the FastAPI surface (including HTTP 422 parse errors).

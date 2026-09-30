@@ -23,6 +23,8 @@ from app.core.nl_parser import NLQueryParser
 from app.core.evaluation import EvaluationHarness
 from app.core.divergence import DivergenceCalculator
 from app.core.ingestion import IngestionPipeline
+from app.core.preprocessing import preprocess
+from app.core.spelling import correct_terms
 
 app = FastAPI(
     title="VaartaVerse Classical IR Engine",
@@ -153,6 +155,8 @@ class VSMQueryRequest(BaseModel):
     collection_filter: Optional[str] = None
     region_filter: Optional[str] = None
     zone_weights: dict = {"title": 0.35, "body": 0.65}
+    auto_correct: bool = False
+    """Correct unknown query terms against the vocabulary (edit distance ≤ 2)."""
 
     @field_validator("zone_weights")
     @classmethod
@@ -172,12 +176,22 @@ class BM25QueryRequest(BaseModel):
     title_boost: float = 1.5
     collection_filter: Optional[str] = None
     region_filter: Optional[str] = None
+    auto_correct: bool = False
+    """Correct unknown query terms against the vocabulary (edit distance ≤ 2)."""
 
 
 class NLQueryRequest(BaseModel):
     query: str
     """Free-text natural language query"""
     top_k: int = 10
+    expand_synonyms: bool = False
+    """WordNet synonym expansion — synonyms weighted below original terms."""
+    expansion_weight: float = 0.3
+    """Weight multiplier for synonym terms (0 < w ≤ 1)."""
+    max_expansions: int = 3
+    """Max synonyms per query term."""
+    auto_correct: bool = False
+    """Correct unknown query terms against the vocabulary (edit distance ≤ 2)."""
 
 
 class FeedbackRequest(BaseModel):
@@ -242,21 +256,55 @@ def search_boolean(req: BooleanQueryRequest):
     return {"mode": "boolean", "query": req.query, "results": results, "count": len(results)}
 
 
+def _apply_corrections(terms: list[str], enabled: bool) -> tuple[list[str], dict[str, str], str]:
+    """
+    Vocabulary-based typo correction for query terms.
+
+    Returns (corrected_terms, corrections_map, corrected_query). When disabled
+    or nothing needs correcting, returns the original terms unchanged.
+    """
+    if not enabled or not terms:
+        return terms, {}, ""
+    vocab = get_index().vocabulary()
+    missing = [t for t in terms if t not in vocab]
+    if not missing:
+        return terms, {}, ""
+    corrections = correct_terms(missing, vocab)
+    if not corrections:
+        return terms, {}, ""
+    corrected = [corrections.get(t, t) for t in terms]
+    return corrected, corrections, " ".join(corrected)
+
+
 @app.post("/search/vsm")
 def search_vsm(req: VSMQueryRequest):
     """
     Vector Space Model retrieval: TF-IDF with always-positive smoothed idf,
     real zone weighting (full-document norms), cosine similarity top-K ranking.
+    With auto_correct, unknown query terms are matched to the closest vocabulary
+    term (edit distance ≤ 2) and reported in `corrections` / `corrected_query`.
     """
     engine = get_vsm()
+    terms = preprocess(req.query)
+    corrected_terms, corrections, corrected_query = _apply_corrections(terms, req.auto_correct)
+    query_used = corrected_query or req.query
+
     results = engine.search(
-        query=req.query,
+        query=query_used,
         top_k=req.top_k,
         zone_weights=req.zone_weights,
         collection_filter=req.collection_filter,
         region_filter=req.region_filter,
     )
-    return {"mode": "vsm", "query": req.query, "results": results, "count": len(results)}
+    return {
+        "mode": "vsm",
+        "query": req.query,
+        "query_changed": bool(corrections),
+        "corrections": corrections,
+        "corrected_query": corrected_query or None,
+        "results": results,
+        "count": len(results),
+    }
 
 
 @app.post("/search/bm25")
@@ -266,8 +314,12 @@ def search_bm25(req: BM25QueryRequest):
     title-zone boost. The classical baseline against the VSM.
     """
     engine = get_bm25()
+    terms = preprocess(req.query)
+    corrected_terms, corrections, corrected_query = _apply_corrections(terms, req.auto_correct)
+    query_used = corrected_query or req.query
+
     results = engine.search(
-        query=req.query,
+        query=query_used,
         top_k=req.top_k,
         k1=req.k1,
         b=req.b,
@@ -275,16 +327,33 @@ def search_bm25(req: BM25QueryRequest):
         collection_filter=req.collection_filter,
         region_filter=req.region_filter,
     )
-    return {"mode": "bm25", "query": req.query, "results": results, "count": len(results)}
+    return {
+        "mode": "bm25",
+        "query": req.query,
+        "query_changed": bool(corrections),
+        "corrections": corrections,
+        "corrected_query": corrected_query or None,
+        "results": results,
+        "count": len(results),
+    }
 
 
 def _vsm_search_with_filters(parsed: dict, req: NLQueryRequest) -> list[dict]:
     filters = parsed.get("filters", {})
+    # Precompute WordNet expansions against the index vocabulary
+    expansion_weights: dict[str, float] = {}
+    if req.expand_synonyms and parsed.get("expansions"):
+        vocab = get_index().vocabulary()
+        w = min(max(req.expansion_weight, 0.0), 1.0)
+        for term in parsed["expanded_terms"]:
+            if term in vocab:
+                expansion_weights[term] = w
     return get_vsm().search(
         query=parsed["normalized_query"] or req.query,
         top_k=req.top_k,
         collection_filter=filters.get("tradition"),
         region_filter=filters.get("region"),
+        expansion_weights=expansion_weights or None,
     )
 
 
@@ -297,8 +366,29 @@ def search_nl_query(req: NLQueryRequest):
     query matches nothing, falls back to ranked VSM (and reports it in `mode`).
     """
     parser = get_nl_parser()
-    parsed = parser.parse(req.query)
+    parsed = parser.parse(
+        req.query,
+        expand_synonyms=req.expand_synonyms,
+        vocabulary=get_index().vocabulary() if req.expand_synonyms else None,
+    )
     fallback_used = False
+
+    # Typo correction (VSM mode only — boolean semantics must stay exact)
+    corrections: dict[str, str] = {}
+    corrected_query = ""
+    if req.auto_correct and parsed["mode"] != "boolean":
+        corrected_terms, corrections, corrected_query = _apply_corrections(
+            parsed["stemmed_terms"], req.auto_correct
+        )
+        if corrections:
+            parsed["corrections"] = corrections
+            parsed["normalized_query"] = corrected_query
+            # Re-map expansion structures onto the corrected terms
+            old2new = corrections
+            parsed["expanded_terms"] = [old2new.get(t, t) for t in parsed.get("expanded_terms", [])]
+            parsed["expansions"] = {
+                old2new.get(k, k): v for k, v in parsed.get("expansions", {}).items()
+            }
     if parsed["mode"] == "boolean":
         try:
             results = get_boolean().search(parsed["structured_query"])
@@ -312,7 +402,11 @@ def search_nl_query(req: NLQueryRequest):
     return {
         "mode": "vsm_fallback" if fallback_used else "nl_query",
         "original_query": req.query,
+        "query_changed": bool(corrections),
+        "corrections": corrections,
+        "corrected_query": corrected_query or None,
         "parsed": parsed,
+        "synonyms_applied": sorted(parsed.get("expanded_terms", [])),
         "results": results,
         "count": len(results),
     }

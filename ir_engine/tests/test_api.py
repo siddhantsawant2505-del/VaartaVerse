@@ -63,6 +63,80 @@ class TestSearchEndpoints:
         assert body["mode"] == "vsm_prf"
         assert body["count"] <= 5
 
+    def test_vsm_no_correction_by_default(self, client):
+        res = client.post("/search/vsm", json={"query": "jackel well", "top_k": 5})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["query_changed"] is False
+        assert body["corrections"] == {}
+
+    def test_vsm_auto_correct(self, client):
+        res = client.post(
+            "/search/vsm",
+            json={"query": "jackel in the forst", "top_k": 5, "auto_correct": True},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["query_changed"] is True
+        assert body["corrections"].get("jackel") == "jackal"
+        assert body["corrections"].get("forst") == "forest"
+        assert "jackal" in body["corrected_query"]
+        assert body["count"] > 0, "corrected query should retrieve"
+
+    def test_vsm_auto_correct_clean_query_unchanged(self, client):
+        res = client.post(
+            "/search/vsm",
+            json={"query": "jackal well", "top_k": 5, "auto_correct": True},
+        )
+        body = res.json()
+        assert body["query_changed"] is False
+        assert body["corrections"] == {}
+
+    def test_bm25_auto_correct(self, client):
+        res = client.post(
+            "/search/bm25",
+            json={"query": "jackel", "top_k": 5, "auto_correct": True},
+        )
+        body = res.json()
+        assert body["corrections"] == {"jackel": "jackal"}
+        assert body["count"] > 0
+
+    def test_nl_query_auto_correct(self, client):
+        res = client.post(
+            "/search/nl-query",
+            json={"query": "jackel trick in the forst", "top_k": 5, "auto_correct": True},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["query_changed"] is True
+        assert body["corrections"].get("forst") == "forest"
+        assert body["parsed"]["normalized_query"].count("forest") >= 1
+
+    def test_nl_query_synonym_expansion_off(self, client):
+        res = client.post("/search/nl-query", json={"query": "clever jackal", "top_k": 5})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["synonyms_applied"] == []
+        assert body["parsed"]["expansions"] == {}
+
+    def test_nl_query_synonym_expansion_on(self, client):
+        res = client.post(
+            "/search/nl-query",
+            json={"query": "wise king of the forest", "top_k": 5, "expand_synonyms": True},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        # 'king' → queen, 'forest' → wood/woodland are in this corpus's vocabulary
+        assert isinstance(body["synonyms_applied"], list)
+        assert body["parsed"]["expansions"], "expected expansions for king/forest"
+        for syn in body["synonyms_applied"]:
+            assert " " not in syn
+        # expansions must be in-vocabulary only
+        vocab = set()
+        from app.main import get_index
+        vocab = get_index().vocabulary()
+        assert set(body["synonyms_applied"]) <= vocab
+
 
 class TestRegistryAndEval:
     def test_health(self, client):
